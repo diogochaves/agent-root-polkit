@@ -39,6 +39,17 @@ Item {
   property bool laptopClosed: false
   property int shakeOffset: 0
 
+  // Who is behind a pkexec request, from the requester helper beside this
+  // file: the coding agent, the reason it gave agent-root, and where it runs.
+  // All of it comes from processes the agent controls, so it is shown apart
+  // from polkit's own line, which names the command.
+  property string requesterAgent: ""
+  property string requesterReason: ""
+  property string requesterContext: ""
+  property int requesterSerial: 0
+  readonly property bool requesterKnown: requesterAgent !== ""
+  readonly property string requesterPath: decodeURIComponent(String(Qt.resolvedUrl("requester")).replace(/^file:\/\//, ""))
+
   readonly property bool dialogVisible: polkitAgent.isActive || closing
   // We show one method at a time. Fingerprint owns the dialog while PAM is
   // waiting on the reader (lid open, sensor enrolled); the moment PAM asks for
@@ -72,6 +83,38 @@ Item {
     errorFlash = false
     submitted = false
     passwordInput.text = ""
+    clearRequester()
+  }
+
+  function clearRequester() {
+    requesterSerial++
+    requesterAgent = ""
+    requesterReason = ""
+    requesterContext = ""
+  }
+
+  function lookUpRequester() {
+    clearRequester()
+    var flow = polkitAgent.flow
+    if (!flow || flow.actionId !== "org.freedesktop.policykit.exec") return
+    requesterProc.command = [requesterPath, String(flow.message || ""), String(requesterSerial)]
+    requesterProc.running = true
+  }
+
+  function applyRequester(raw) {
+    var info
+    try { info = JSON.parse(String(raw || "")) } catch (e) { return }
+    // A late answer for a request that is gone or was replaced.
+    if (!info || info.tag !== String(requesterSerial) || !polkitAgent.isActive) return
+
+    // agent-root run by hand, with no agent above it, still has a reason.
+    requesterAgent = String(info.agent || (info.via === "agent-root" ? "agent-root" : ""))
+    requesterReason = String(info.reason || "")
+    var context = []
+    if (info.project) context.push(info.project)
+    if (info.workspace && info.workspace !== info.project) context.push("herdr " + info.workspace)
+    if (info.session) context.push("session " + info.session)
+    requesterContext = context.join(" · ")
   }
 
   function syncFromFlow() {
@@ -95,6 +138,7 @@ Item {
     passwordInput.text = ""
     refreshLidState()
     syncFromFlow()
+    lookUpRequester()
     Qt.callLater(refocus)
   }
 
@@ -171,6 +215,12 @@ Item {
     command: ["bash", "-c", "omarchy-hw-laptop-closed && echo closed || echo open"]
     stdout: StdioCollector { id: laptopClosedOut; waitForEnd: true }
     onExited: root.laptopClosed = String(laptopClosedOut.text || "").trim() === "closed"
+  }
+
+  Process {
+    id: requesterProc
+    stdout: StdioCollector { id: requesterOut; waitForEnd: true }
+    onExited: root.applyRequester(requesterOut.text)
   }
 
   PolkitAgent {
@@ -364,7 +414,75 @@ Item {
       }
     }
 
+    // The agent's word: its name, then its reason as a quote, with where it
+    // runs below. Plain text throughout, since the agent wrote the reason.
     Rectangle {
+      id: requesterPill
+      readonly property int maxWidth: Math.min(Style.space(560), panel.width - Style.gapsOut * 2)
+      visible: root.requesterKnown
+      width: Math.min(Math.max(requesterAgentText.implicitWidth + Style.space(6) + requesterReasonText.implicitWidth, requesterContextText.implicitWidth) + Style.space(24), maxWidth)
+      height: requesterColumn.implicitHeight + Style.space(14)
+      anchors.horizontalCenter: card.horizontalCenter
+      anchors.bottom: justificationPill.top
+      anchors.bottomMargin: Style.space(6)
+      radius: root.cornerRadius
+      color: root.background
+
+      Column {
+        id: requesterColumn
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.leftMargin: Style.space(12)
+        anchors.rightMargin: Style.space(12)
+        spacing: Style.space(2)
+
+        Row {
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.space(6)
+
+          Text {
+            id: requesterAgentText
+            textFormat: Text.PlainText
+            text: root.requesterAgent + ":"
+            color: root.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+
+          Text {
+            id: requesterReasonText
+            textFormat: Text.PlainText
+            width: Math.min(implicitWidth, requesterColumn.width - requesterAgentText.implicitWidth - Style.space(6))
+            text: root.requesterReason !== "" ? "“" + root.requesterReason + "”" : "no reason given"
+            color: root.foreground
+            opacity: root.requesterReason !== "" ? 1 : 0.5
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.italic: true
+            elide: Text.ElideRight
+          }
+        }
+
+        Text {
+          id: requesterContextText
+          visible: text !== ""
+          textFormat: Text.PlainText
+          width: parent.width
+          text: root.requesterContext
+          color: root.foreground
+          opacity: 0.6
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          horizontalAlignment: Text.AlignHCenter
+          elide: Text.ElideMiddle
+        }
+      }
+    }
+
+    Rectangle {
+      id: justificationPill
       width: Math.min(justificationText.implicitWidth + Style.space(24), panel.width - Style.gapsOut * 2)
       height: Style.space(28)
       anchors.horizontalCenter: card.horizontalCenter

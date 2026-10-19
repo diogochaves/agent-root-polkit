@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# requester - who is behind a pending pkexec request, for the polkit dialog.
+#
+# Given the dialog's message, finds the pkexec process waiting on it, the
+# agent-root reason it was asked with, and the coding agent, project and herdr
+# workspace above it in the process tree. Prints one JSON object, with only a
+# "tag" when it can't tell (no match, or two pending requests look the same).
+#
+# Everything read here comes from processes that run as you, so an agent can
+# fake all of it. It is context for the dialog, not proof of who asked.
+#
+# Usage: requester MESSAGE [TAG]    TAG is echoed back, to match the answer
+set -uo pipefail
+
+message=${1:-}
+tag=${2:-}
+
+answer() { jq -cn --arg tag "$tag" "$@" '$ARGS.named'; }
+
+# pkexec's message: Authentication is needed to run `$(cmdline_short)' as ...
+re='^Authentication is (needed|required) to run `(.*)'"'"' as '
+[[ $message =~ $re ]] || { answer; exit 0; }
+shown=${BASH_REMATCH[2]}
+
+# A command line over 80 characters is shown as its start ... its end.
+prefix=$shown suffix=""
+if [[ $shown == *" ... "* ]]; then
+  prefix=${shown%%" ... "*}
+  suffix=${shown##*" ... "}
+fi
+
+args() { tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null; }
+ppid() { awk '/^PPid:/ { print $2 }' "/proc/$1/status" 2>/dev/null; }
+env_of() { tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null | sed -n "s/^$2=//p" | head -n1; }
+
+# The command line pkexec builds for the dialog: the program's full path and
+# its arguments, after pkexec's own options.
+pkexec_cmdline() {
+  local pid=$1 parent=$2 program=""
+  local -a argv
+  mapfile -t argv < <(args "$pid")
+  set -- "${argv[@]:1}"
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --user | -u) shift 2 ;;
+      --disable-internal-agent | --keep-cwd) shift ;;
+      *) break ;;
+    esac
+  done
+  [ "$#" -gt 0 ] || return 1
+  program=$1
+  shift
+  # pkexec looks a bare name up in the PATH of whoever ran it.
+  if [[ $program != /* ]]; then
+    program=$(PATH=$(env_of "$parent" PATH) type -P -- "$program") || return 1
+  fi
+  printf '%s' "$program${*:+ $*}"
+}
+
+match=""
+for dir in /proc/[0-9]*; do
+  pid=${dir#/proc/}
+  read -r comm 2>/dev/null <"$dir/comm" || continue
+  [ "$comm" = pkexec ] || continue
+  parent=$(ppid "$pid") || continue
+  line=$(pkexec_cmdline "$pid" "$parent") || continue
+  if [ -n "$suffix" ]; then
+    [[ $line == "$prefix"* && $line == *"$suffix" ]] || continue
+  else
+    [ "$line" = "$shown" ] || continue
+  fi
+  # Two requests that look the same can't be told apart: say nothing.
+  [ -z "$match" ] || { answer; exit 0; }
+  match=$parent
+done
+[ -n "$match" ] || { answer; exit 0; }
+
+# agent-root runs pkexec itself, with the reason as its first argument, or in
+# AGENT_ROOT_REASON when yay or paru call it in place of sudo.
+via=pkexec reason=""
+mapfile -t argv < <(args "$match")
+for i in 0 1; do
+  if [ "${argv[i]##*/}" = agent-root ]; then
+    via="agent-root"
+    reason=$(env_of "$match" AGENT_ROOT_REASON)
+    [ -n "$reason" ] || reason=${argv[i + 1]:-}
+    break
+  fi
+done
+
+agent_name() {
+  case $1 in
+    claude) echo Claude ;;
+    codex) echo Codex ;;
+    cursor-agent | cursor) echo Cursor ;;
+    opencode) echo OpenCode ;;
+    gemini) echo Gemini ;;
+    hermes) echo Hermes ;;
+    pi) echo pi ;;
+    aider) echo Aider ;;
+    goose) echo Goose ;;
+    amp) echo Amp ;;
+    crush) echo Crush ;;
+    copilot) echo Copilot ;;
+    *) return 1 ;;
+  esac
+}
+
+# Up the tree to the first coding agent, by its program's name, or the script
+# a node, bun or python runs. Only your own processes: the walk stops at root.
+agent="" agent_pid=""
+pid=$match
+while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$(stat -c %u "/proc/$pid" 2>/dev/null)" = "$(id -u)" ]; do
+  mapfile -t argv < <(args "$pid")
+  if agent=$(agent_name "$(cat "/proc/$pid/comm" 2>/dev/null)") ||
+    agent=$(agent_name "${argv[0]##*/}") ||
+    agent=$(agent_name "${argv[1]##*/}"); then
+    agent_pid=$pid
+    break
+  fi
+  pid=$(ppid "$pid")
+done
+
+# An agent that names itself, like Claude Code's AI_AGENT=claude-code_2-1-302_agent.
+if [ -z "$agent" ]; then
+  case $(env_of "$match" AI_AGENT) in
+    claude-code*) agent=Claude ;;
+    codex*) agent=Codex ;;
+    cursor*) agent=Cursor ;;
+    opencode*) agent=OpenCode ;;
+    gemini*) agent=Gemini ;;
+    ?*) agent=$(env_of "$match" AI_AGENT) ;;
+  esac
+fi
+
+# The project is the folder the agent runs in, by its git repository's name.
+project=""
+cwd=$(readlink "/proc/${agent_pid:-$match}/cwd" 2>/dev/null)
+if [ -n "$cwd" ]; then
+  top=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || top=$cwd
+  # Your home folder says nothing about which project asks.
+  [ "$top" = "$HOME" ] || project=${top##*/}
+fi
+
+workspace=""
+herdr_id=$(env_of "$match" HERDR_WORKSPACE_ID)
+if [ -n "$herdr_id" ] && command -v herdr >/dev/null; then
+  workspace=$(timeout 1 herdr workspace get "$herdr_id" 2>/dev/null | jq -r '.result.workspace.label // empty' 2>/dev/null)
+fi
+
+session=$(env_of "$match" CLAUDE_CODE_SESSION_ID)
+
+answer --arg via "$via" --arg reason "$reason" --arg agent "$agent" \
+  --arg project "$project" --arg workspace "$workspace" --arg session "${session:0:8}"

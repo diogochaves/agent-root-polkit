@@ -36,10 +36,37 @@ the line is left out rather than guessed.
 All of this comes from processes that run as you, so an agent can fake any of
 it. It is context, not proof: the command polkit shows is the part to read.
 
-Matching on the message is the workaround. polkit already tells the agent which
-process asked (`polkit.subject-pid`, which for pkexec is agent-root itself),
-but Quickshell's polkit API leaves those details out, so the dialog never sees
-them.
+## Why it matches on the message
+
+Matching the message against `/proc` is the workaround. These were the other
+ways to get the reason into the dialog, checked against polkit 127 and
+Quickshell 0.3.1:
+
+- **polkit's own details.** polkitd passes the agent `polkit.subject-pid`,
+  and for pkexec the subject is its parent, agent-root itself, so the dialog
+  would know exactly who asks with no matching at all. Quickshell's polkit
+  listener drops the details (`listener.hpp`: "Details intentionally omitted
+  because nothing seems to use them"), so a QML dialog only gets the action id,
+  message, icon and cookie. This is the right fix, and it needs Quickshell to
+  expose them, then Omarchy's plugin to pass them on.
+- **The reason in the message.** pkexec writes the message itself ("needed to
+  run `$(cmdline_short)'"). A `.policy` file with
+  `org.freedesktop.policykit.exec.path` can replace it, but only with a fixed
+  text per program, installed as root, and its `$(…)` fields are only the
+  details pkexec sets. There's no way to pass a reason per call.
+- **The reason in the command line**, say `pkexec env REASON=… pacman …`. It
+  would show in any dialog, even the stock one, but pkexec cuts a command line
+  over 80 characters to its start and end, so the reason would push the
+  command out of sight. Not a good trade in the one place you need to read it.
+- **Details of our own, through `pkcheck --details`.** polkitd only accepts
+  details from trusted callers ("Only trusted callers (e.g. uid 0 or an action
+  owner) can use CheckAuthorization() and pass details"), and `pkcheck` only
+  checks, so something running as root would still have to run the command.
+  Quickshell would drop the details anyway.
+- **A side channel**, agent-root writing the reason to a file under
+  `$XDG_RUNTIME_DIR`. The dialog would still have to work out which request
+  the file belongs to, the same matching as now, and agent-root would need a
+  change for it. Reading agent-root's arguments needs nothing from it.
 
 ## Install
 

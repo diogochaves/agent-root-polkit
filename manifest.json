@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "chaves.polkit",
+  "name": "Agent Polkit",
+  "version": "1.0.0",
+  "author": "Omarchy",
+  "description": "Omarchy's polkit dialog, plus which coding agent is asking and why.",
+  "omarchy": {
+    "capabilities": [
+      "authentication"
+    ],
+    "clonedFrom": "omarchy.polkit"
+  },
+  "kinds": [
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "PolkitAgent.qml"
+  }
+}
